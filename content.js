@@ -1,395 +1,463 @@
-// content.js - FINAL MERGED (HUMAN SIM + UPLOAD + ERROR HANDLING)g
+if (window.hasRunAutoFill) {
+    console.log("🛑 Script already active.");
+} else {
+    window.hasRunAutoFill = true;
 
-{ 
-    let lastFormHash = ''; 
-    // Global Memory
-    let interactedFields = new Set();
-    let uploadedFiles = new Set(); 
-    let correctionAttempts = 0; // To prevent infinite error loops
-
-    const NEXT_BUTTON_SELECTORS = [
-      'Next', 'Continue', 'Proceed', 'Submit', 'Apply', 'Finish', 'Done',
-      'Register', 'Sign Up', 'Go Next', 'Move Forward', 'Next Step', 
-      'Save and Continue', 'Confirm', 'Checkout', 'Get Started'          
-    ];
-
-    function safeSendMessage(message, callback) {
-        if (chrome.runtime?.id) {
-            chrome.runtime.sendMessage(message, callback);
-        }
-    }
-
-    const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-    function autoFillAndNavigate() {
-      const currentFormContent = document.body.innerText.replace(/\s+/g, ' ').trim();
-      
-      // Reset memory if page changed significantly (New Step)
-      if (currentFormContent !== lastFormHash) {
-          interactedFields.clear(); 
-          uploadedFiles.clear(); 
-          correctionAttempts = 0; // Reset error retries
-          lastFormHash = currentFormContent;
-      }
-
-      console.log("Starting Universal Auto-Fill...");
-      
-      const formFields = extractFormFields(); 
-
-      if (formFields.length === 0) {
-        console.log("No fillable form fields found. Checking navigation...");
-        attemptToClickNext(); 
-        return;
-      }
-
-      safeSendMessage({
-        action: "fetchFormData",
-        fields: formFields
-      }, async (response) => {
-        if (response && response.status === "success" && response.fillData) {
-          console.log("Received AI data. Filling Fields...");
-          await fillFieldsSequentially(response.fillData);
-          console.log("Filling complete. Checking navigation...");
-          setTimeout(attemptToClickNext, 2000);
-        } else {
-          attemptToClickNext(); 
-        }
-      });
-      
-      startObserver(); 
-    }
-
-    // --- HELPER: EXTRACT VALIDATION ERRORS ---
-    function extractValidationErrors() {
-        const errors = [];
-        // Angular Material Errors
-        document.querySelectorAll('mat-error').forEach(e => errors.push(e.innerText));
-        // Standard/Bootstrap Errors
-        document.querySelectorAll('.error, .invalid, .text-danger, [role="alert"], .validation-message').forEach(e => {
-            if (e.offsetParent !== null) errors.push(e.innerText); // Only visible errors
-        });
-        return [...new Set(errors)]; // Return unique errors
-    }
-
-    // --- HELPER: UPLOAD FILE ---
-    async function uploadFile(element) {
-        try {
-            const uid = element.id || element.name;
-            if (uploadedFiles.has(uid) || element.value !== "") return;
-
-            console.log("📂 Uploading sample.pdf to:", element);
-            element.scrollIntoView({ behavior: "smooth", block: "center" });
-            await wait(300);
-
-            const fileUrl = chrome.runtime.getURL("sample.pdf");
-            const response = await fetch(fileUrl);
-            const blob = await response.blob();
-            const file = new File([blob], "sample.pdf", { type: "application/pdf" });
-            
-            const dataTransfer = new DataTransfer();
-            dataTransfer.items.add(file);
-            element.files = dataTransfer.files;
-            
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('blur', { bubbles: true }));
-            
-            uploadedFiles.add(uid);
-            await wait(1500); 
-        } catch (err) {
-            console.error("Failed to upload file:", err);
-        }
-    }
-
-    // --- HELPER: CLICK CENTER (Coordinate Click) ---
-    function clickCenter(element) {
-        const rect = element.getBoundingClientRect();
-        const x = rect.left + (rect.width / 2);
-        const y = rect.top + (rect.height / 2);
+    (function() {
+        let lastUrl = window.location.href;
         
-        element.scrollIntoView({ behavior: "smooth", block: "center" });
+        let interactedFields = new Set();
+        let modalInteracted = new Set(); 
+        let lockedGroups = new Set(); 
+        let observer = null;
 
-        const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true, clientX: x, clientY: y });
-        const downEvent = new MouseEvent('mousedown', { view: window, bubbles: true, cancelable: true, clientX: x, clientY: y });
+        const NEXT_BUTTON_SELECTORS = ['Next', 'Continue', 'Proceed', 'Submit', 'Apply', 'Finish', 'Done', 'Confirm', 'Next Step','Get Started'];
+        const SIDE_QUEST_BUTTONS = ['Validate Address', 'Verify Address', 'Check Availability', 'Add'];
+        const MODAL_SAVE_BUTTONS = ['Save', 'Use this Address', 'Confirm', 'Ok', 'Yes','Done','I Understand', 'Continue'];
 
-        element.dispatchEvent(downEvent);
-        element.dispatchEvent(clickEvent);
-        element.click();
-    }
+        const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // --- HELPER: CLICK LABEL ---
-    function clickLabel(element) {
-        if (element.id) {
-            const label = document.querySelector(`label[for="${element.id}"]`);
-            if (label) {
-                label.click();
+        function safeSendMessage(message, callback) {
+            if (chrome.runtime?.id) chrome.runtime.sendMessage(message, callback);
+        }
+
+        async function autoFillAndNavigate() {
+            // 1. MODAL CHECK
+            const modal = document.querySelector('mat-dialog-container, .modal, .popup');
+            if (modal) {
+                console.log("🛡️ Modal Detected. Pausing Main Loop.");
+                await handleModal(modal);
+                return; 
+            }
+
+            const currentUrl = window.location.href;
+            if (currentUrl !== lastUrl) {
+                console.log("🔄 NEW URL DETECTED! Wiping Memory.");
+                interactedFields.clear(); 
+                modalInteracted.clear(); 
+                lockedGroups.clear(); 
+                lastUrl = currentUrl;
+            }
+
+            console.log("🚀 Starting Fill Sequence...");
+            const formFields = extractFormFields(document); 
+
+            if (formFields.length === 0) {
+                await handleSpecialButtons(); 
+                attemptToClickNext(); 
                 return;
             }
+
+            safeSendMessage({ action: "fetchFormData", fields: formFields }, async (response) => {
+                if (response && response.fillData) {
+                    await fillFieldsSequentially(response.fillData, document);
+                    await handleSpecialButtons();
+                    console.log("✅ Filling Complete.");
+                    await wait(1000);
+                    attemptToClickNext();
+                }
+            });
         }
-        if (element.parentElement) {
-            element.parentElement.click();
-        }
-    }
 
-    function setNativeValue(element, value) {
-        element.focus();
-        document.execCommand('selectAll', false, null);
-        document.execCommand('delete', false, null);
-        const success = document.execCommand('insertText', false, value);
-        if (!success) element.value = value;
-        
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-        setTimeout(() => element.dispatchEvent(new Event('blur', { bubbles: true })), 50);
-    }
-
-    function extractFormFields() {
-      const selectors = 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select, mat-select, div[role="combobox"]';
-      const elements = document.querySelectorAll(selectors);
-      const fieldsData = [];
-
-      elements.forEach(element => {
-        if (element.offsetParent === null || element.disabled) return; 
-        const field = {
-          id: element.id,
-          name: element.name || element.getAttribute('formcontrolname') || '',
-          type: element.type || element.tagName.toLowerCase(),
-          placeholder: element.placeholder,
-          currentValue: element.value,
-          label: getFieldLabel(element)
-        };
-        fieldsData.push(field);
-      });
-      return fieldsData;
-    }
-
-    function getFieldLabel(element) {
-      let labelText = '';
-      if (element.getAttribute('aria-label')) return element.getAttribute('aria-label');
-      if (element.id) {
-        const label = document.querySelector(`label[for="${element.id}"]`);
-        if (label) labelText = label.innerText.trim();
-      }
-      if (!labelText && element.closest('label')) labelText = element.closest('label').innerText.trim();
-      if (!labelText && element.parentElement) labelText = element.parentElement.innerText.trim();
-      if (!labelText && element.parentElement && element.parentElement.parentElement) {
-          labelText = element.parentElement.parentElement.innerText.trim();
-      }
-      return labelText || element.placeholder || element.name || element.id || 'Unknown Field';
-    }
-
-    async function fillFieldsSequentially(fillData, isCorrection = false) {
-        const sanitize = (str) => str.toLowerCase().replace(/[\s\-_]/g, '');
-        const dataMap = new Map(Object.entries(fillData).map(([key, value]) => [sanitize(key), value]));
-        const selectors = 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select, mat-select, div[role="combobox"]';
-        const elements = Array.from(document.querySelectorAll(selectors));
-
-        for (const element of elements) {
-            if (element.disabled || element.offsetParent === null) continue;
-
-            const elementId = element.id ? sanitize(element.id) : null;
-            const elementName = element.name ? sanitize(element.name) : null;
-            const elementLabel = sanitize(getFieldLabel(element));
-            const elementType = element.type || element.tagName.toLowerCase(); 
-            const isDropdown = element.getAttribute('role') === 'combobox' || element.tagName === 'MAT-SELECT' || elementLabel.includes('select');
-
-            // Unique ID logic
-            const uniqueId = element.id || element.getAttribute('name') || getFieldLabel(element);
-
-            // 1. FILE UPLOAD
-            if (elementType === 'file') {
-                await uploadFile(element);
-                continue;
-            }
-
-            // 2. SKIP IF INTERACTED (Unless correcting errors)
-            if (!isCorrection && interactedFields.has(uniqueId)) continue;
+        // --- HANDLERS ---
+        async function handleModal(modal) {
+            await wait(1000); 
+            const boxes = modal.querySelectorAll('mat-checkbox, input[type="checkbox"]');
             
-            // 3. SKIP IF FILLED (Unless correcting errors)
-            if (!isCorrection) {
-                if ((element.type === 'checkbox' || element.type === 'radio') && element.checked) {
-                    interactedFields.add(uniqueId);
-                    continue;
-                }
-                if ((element.type === 'text' || element.tagName === 'TEXTAREA') && element.value) {
-                    interactedFields.add(uniqueId);
-                    continue;
-                }
-            }
-
-            let valueToFill = null;
-            if (elementId && dataMap.has(elementId)) valueToFill = dataMap.get(elementId);
-            else if (elementName && dataMap.has(elementName)) valueToFill = dataMap.get(elementName);
-            else {
-                for (const [key, value] of dataMap.entries()) {
-                    if (elementLabel.includes(key) && key.length > 3) { 
-                        valueToFill = value;
-                        break;
+            for (const box of boxes) {
+                const boxId = box.id || "unknown_modal_box_" + Math.random();
+                if (!modalInteracted.has(boxId)) {
+                    if (box.readOnly || box.disabled || box.getAttribute('aria-disabled') === 'true') continue;
+                    if (!isChecked(box)) {
+                        console.log("   -> Force-checking modal checkbox");
+                        await smartClick(box);
+                        modalInteracted.add(boxId); 
                     }
                 }
             }
 
-            if (valueToFill || isDropdown) {
-                try {
-                    await wait(100);
-                    const fillValueString = valueToFill ? String(valueToFill).toLowerCase() : "";
-
-                    // 4. CHECKBOX
-                    if (elementType === 'checkbox') {
-                        const label = getFieldLabel(element).toLowerCase();
-                        const choices = fillValueString.split(',').map(s => s.trim());
-                        const shouldCheck = fillValueString === 'true' || fillValueString === 'yes' || choices.some(choice => label.includes(choice));
-
-                        if (shouldCheck && !element.checked) {
-                            clickLabel(element);
-                            interactedFields.add(uniqueId); 
-                            await wait(200);
-                        }
-                    }
-                    // 5. RADIO
-                    else if (elementType === 'radio') {
-                         const val = element.value.toLowerCase();
-                         const label = getFieldLabel(element).toLowerCase();
-                         const match = fillValueString && (label.includes(fillValueString) || val.includes(fillValueString));
-                         if (match) {
-                             clickLabel(element);
-                             const groupName = element.name;
-                             if (groupName) document.querySelectorAll(`input[name="${groupName}"]`).forEach(el => interactedFields.add(el.id || el.name));
-                             interactedFields.add(uniqueId);
-                             await wait(100);
-                         }
-                    }
-                    // 6. DROPDOWNS
-                    else if (isDropdown) {
-                        console.log("Force Opening Dropdown:", element);
-                        clickCenter(element); 
-                        await wait(600);
-                        element.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', keyCode: 40, bubbles: true }));
-                        await wait(100);
-                        element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-                        interactedFields.add(uniqueId); 
-                        await wait(300);
-                    }
-                    // 7. TEXT
-                    else {
-                        if (elementLabel.includes('date') && valueToFill && valueToFill.includes('/')) {
-                            if (elementType === 'date') {
-                                const [m, d, y] = valueToFill.split('/');
-                                valueToFill = `${y}-${m}-${d}`;
-                            }
-                        }
-                        if (valueToFill) setNativeValue(element, valueToFill);
-                        interactedFields.add(uniqueId);
-                        await wait(50);
-                    }
-                } catch (e) {
-                    console.error("Error filling field", element, e);
-                }
+            const modalFields = extractFormFields(modal);
+            if (modalFields.length > 0) {
+                await new Promise(resolve => {
+                    safeSendMessage({ action: "fetchFormData", fields: modalFields }, async (resp) => {
+                        if (resp && resp.fillData) await fillFieldsSequentially(resp.fillData, modal);
+                        resolve();
+                    });
+                });
             }
-        }
-    }
-
-    function attemptToClickNext() {
-      let nextButton = null;
-      const elements = document.querySelectorAll('button, a, input[type="submit"], [role="button"]');
-      for (const el of elements) {
-        const textContent = el.textContent ? el.textContent.trim() : '';
-        if (textContent.toLowerCase().includes('month') || textContent.toLowerCase().includes('year')) continue;
-        for (const keyword of NEXT_BUTTON_SELECTORS) {
-            if (textContent.includes(keyword)) {
-                nextButton = el;
-                break;
-            }
-        }
-        if (nextButton) break;
-      }
-
-      if (nextButton) {
-        const buttonText = nextButton.textContent.trim();
-        const codeToExecute = `
-          (function() {
-            const target = Array.from(document.querySelectorAll('button, a, input[type="submit"], [role="button"]')).find(el => 
-                (el.textContent.trim() === '${buttonText}' || el.innerText.trim() === '${buttonText}')
+            await wait(500);
+            const saveBtn = Array.from(modal.querySelectorAll('button')).find(b => 
+                MODAL_SAVE_BUTTONS.some(kw => b.innerText.includes(kw))
             );
-            if (target) {
-                target.click(); 
-                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                return true;
+            if (saveBtn) {
+                console.log("   💾 Saving Modal...");
+                saveBtn.click();
+                await wait(2000); 
             }
-            return false;
-          })();
-        `;
-        safeSendMessage({ action: 'executeGlobalScript', code: codeToExecute }, (response) => {
-            // *** SELF-HEALING LOGIC ***
-            setTimeout(async () => {
-                 const currentContent = document.body.innerText.replace(/\s+/g, ' ').trim();
-                 
-                 // If content hasn't changed, we might be stuck
-                 if (currentContent === lastFormHash) {
-                     const errors = extractValidationErrors();
-                     
-                     if (errors.length > 0 && correctionAttempts < 2) {
-                         console.warn("⚠️ Validation Errors Found:", errors);
-                         correctionAttempts++;
-                         
-                         // Ask AI to fix these specific errors
-                         const formFields = extractFormFields();
-                         safeSendMessage({
-                            action: "fetchCorrectionData", // This must be handled in background.js
-                            fields: formFields,
-                            errors: errors
-                         }, async (resp) => {
-                             if (resp && resp.status === "success") {
-                                 console.log("🩹 Applying Corrections...");
-                                 // Passing true for 'isCorrection' allows overwriting bad data
-                                 await fillFieldsSequentially(resp.fillData, true); 
-                                 setTimeout(attemptToClickNext, 1000); 
-                             }
-                         });
-                         return; 
-                     }
-                     console.warn("Content unchanged & No fixable errors. Stopping.");
-                     safeSendMessage({ action: 'flowComplete' });
-                 } else {
-                     // Page changed successfully!
-                     if (document.querySelector('form, input, textarea')) autoFillAndNavigate();
-                 }
-             }, 3000); // Wait 3s for validation messages
-        });
-      } else {
-        safeSendMessage({ action: 'flowComplete' }); 
-      }
-    }
+        }
 
-    function startObserver() {
-        const observer = new MutationObserver((mutationsList, observer) => {
-            let formChanged = false;
-            for (const mutation of mutationsList) {
-                if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
-                     if (document.querySelector('form, input, textarea')) {
-                        formChanged = true;
-                        break;
-                     }
+        async function handleSpecialButtons() {
+            if (document.querySelector('mat-dialog-container, .modal, .popup')) return;
+
+            const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            const sideQuestBtn = buttons.find(b => {
+                const txt = b.innerText.trim();
+                const isDisabled = b.disabled || b.classList.contains('disabled') || b.getAttribute('aria-disabled') === 'true';
+                return SIDE_QUEST_BUTTONS.some(kw => txt.includes(kw)) && b.offsetParent !== null && !isDisabled;
+            });
+
+            if (sideQuestBtn) {
+                const btnText = sideQuestBtn.innerText.trim();
+                if (lockedGroups.has(btnText)) return;
+
+                console.log("🛡️ Clicking Side Quest Button:", btnText);
+                sideQuestBtn.click();
+                lockedGroups.add(btnText); 
+                
+                await wait(2500); 
+                const modal = document.querySelector('mat-dialog-container, .modal, .popup');
+                if (modal) await handleModal(modal);
+            }
+        }
+
+        // --- HELPERS ---
+        function setNativeValue(element, value, label) {
+            let currentVal = element.value || "";
+            const cleanVal = currentVal.replace(/[_\-\/\s]/g, '');
+            const lowerLabel = label.toLowerCase();
+            if (cleanVal.length > 0 && !currentVal.includes("Test") && !currentVal.includes("Unknown") && !currentVal.includes("N/A")) return;
+
+            let finalValue = value;
+            if (lowerLabel.includes('date') || lowerLabel.includes('dob') || lowerLabel.includes('birth') || lowerLabel.includes('mm/dd/yyyy')) {
+                finalValue = "01/01/1990"; 
+            } else if (lowerLabel.includes('ssn') || lowerLabel.includes('social')) {
+                finalValue = "123456789"; 
+            } else if (lowerLabel.includes('phone')) {
+                finalValue = "1234567890";
+            }
+            if (finalValue === "N/A" && (lowerLabel.includes('date') || lowerLabel.includes('mm/dd/yyyy'))) {
+                finalValue = "01/01/1990";
+            }
+
+            console.log(`   -> Filling "${finalValue}" into "${label}"`);
+            element.focus();
+            const proto = Object.getPrototypeOf(element);
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            if (setter) setter.call(element, finalValue);
+            else element.value = finalValue;
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            element.dispatchEvent(new Event('blur', { bubbles: true }));
+        }
+
+        async function uploadRealFile(inputElement) {
+            try {
+                const url = chrome.runtime.getURL("sample.pdf");
+                const response = await fetch(url);
+                const blob = await response.blob();
+                
+                const file = new File([blob], "sample.pdf", { type: 'application/pdf' });
+                
+                const dataTransfer = new DataTransfer();
+                dataTransfer.items.add(file);
+                inputElement.files = dataTransfer.files;
+
+                console.log(`📂 Uploading "sample.pdf" (Real File) to:`, inputElement);
+
+                inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+                inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+            } catch (error) {
+                console.error("❌ Failed to upload sample.pdf. Ensure it is in 'web_accessible_resources' in manifest.json", error);
+            }
+        }
+
+        function isChecked(element) {
+            return element.checked || 
+                   element.getAttribute('aria-checked') === 'true' || 
+                   element.closest('.mat-checkbox-checked') !== null ||
+                   element.closest('.mat-radio-checked') !== null ||
+                   element.classList.contains('mat-checkbox-checked') ||
+                   element.classList.contains('mat-radio-checked');
+        }
+
+        function getGroupId(element) {
+            if (element.name) return `NAME:${element.name}`;
+            const matGroup = element.closest('mat-radio-group');
+            if (matGroup && matGroup.id) return `MAT:${matGroup.id}`;
+            if (element.parentElement) return `PARENT:${element.parentElement.className}`;
+            return null;
+        }
+
+        async function smartClick(element) {
+            if (element.disabled || element.readOnly || element.getAttribute('aria-disabled') === 'true') return;
+
+            const type = element.type || element.tagName.toLowerCase();
+            const isRadio = type === 'radio' || element.tagName === 'MAT-RADIO-BUTTON';
+            const groupId = getGroupId(element);
+
+            if (isRadio && groupId) {
+                if (lockedGroups.has(groupId)) return; 
+                if (isChecked(element) || element.closest('mat-radio-group')?.querySelector('.mat-radio-checked')) {
+                    lockedGroups.add(groupId); 
+                    return;
                 }
             }
-            if (formChanged) {
-                observer.disconnect();
-                setTimeout(autoFillAndNavigate, 1500); 
-            }
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-    }
 
-    if (!window.hasAutoFillListener) {
+            console.log("⚡ CLICKING:", element); 
+            element.scrollIntoView({ behavior: "smooth", block: "center" });
+            await wait(100);
+
+            const matInner = element.closest('mat-checkbox')?.querySelector('.mat-checkbox-inner-container') ||
+                             element.closest('mat-radio-button')?.querySelector('.mat-radio-container');
+                             
+            if (matInner) matInner.click();
+            else if (element.id && document.querySelector(`label[for="${element.id}"]`)) document.querySelector(`label[for="${element.id}"]`).click();
+            else element.click();
+            
+            await wait(50);
+            if (!isChecked(element) && (type === 'checkbox' || element.tagName === 'MAT-CHECKBOX')) {
+                element.checked = true;
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            if (isRadio && groupId) lockedGroups.add(groupId);
+            await wait(150);
+        }
+
+        function isReadOnlyField(el) {
+            return el.readOnly || 
+                   el.disabled || 
+                   el.getAttribute('readonly') !== null || 
+                   el.getAttribute('aria-readonly') === 'true' || 
+                   el.getAttribute('aria-disabled') === 'true' ||
+                   el.classList.contains('disabled');
+        }
+
+        function extractFormFields(rootElement) {
+            const selectors = 'input:not([type="hidden"]), textarea, select, mat-select, mat-checkbox, mat-radio-button';
+            const elements = rootElement.querySelectorAll(selectors);
+            
+            return Array.from(elements).filter(el => {
+                return el.offsetParent !== null && !isReadOnlyField(el);
+            }).map(el => ({
+                id: el.id,
+                name: el.name || el.getAttribute('formcontrolname') || '',
+                type: el.type || el.tagName.toLowerCase(),
+                label: getFieldLabel(el)
+            }));
+        }
+
+        function getFieldLabel(element) {
+            let labelText = '';
+            if (element.id && document.querySelector(`label[for="${element.id}"]`)) {
+                labelText = document.querySelector(`label[for="${element.id}"]`).innerText;
+            }
+            if (!labelText && element.closest('label')) labelText = element.closest('label').innerText;
+            if (!labelText && element.closest('mat-form-field')) {
+                const matLabel = element.closest('mat-form-field').querySelector('mat-label');
+                if (matLabel) labelText = matLabel.innerText;
+            }
+            if (!labelText && element.closest('mat-checkbox')) labelText = element.closest('mat-checkbox').innerText;
+            if (!labelText && element.closest('mat-radio-button')) labelText = element.closest('mat-radio-button').innerText;
+            return (labelText || element.placeholder || element.name || "Unknown").replace(/\s+/g, ' ').trim();
+        }
+
+        async function fillFieldsSequentially(fillData, rootElement) {
+            const sanitize = (str) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const aiKeys = Object.keys(fillData).map(k => sanitize(k));
+            const isFallback = fillData["fallback"] === "true";
+
+            const elements = Array.from(rootElement.querySelectorAll('input:not([type="hidden"]), textarea, select, mat-select, mat-checkbox, mat-radio-button'));
+
+            for (const element of elements) {
+                // ============================================================
+                // 🛑 GLOBAL READ-ONLY GUARD
+                // ============================================================
+                if (element.offsetParent === null || isReadOnlyField(element)) {
+                    continue; 
+                }
+
+                const type = element.type || element.tagName.toLowerCase();
+                const isRadio = type === 'radio' || type === 'mat-radio-button';
+                const isCheckbox = type === 'checkbox' || type === 'mat-checkbox';
+                const isFile = type === 'file';
+                const groupId = getGroupId(element);
+                const rawLabel = getFieldLabel(element);
+                const cleanLabel = sanitize(rawLabel);
+                const uniqueId = element.id || rawLabel;
+
+                if (interactedFields.has(uniqueId)) continue;
+
+                // 📂 FILE UPLOAD
+                if (isFile) {
+                    if (element.files && element.files.length > 0) continue; 
+                    await uploadRealFile(element);
+                    interactedFields.add(uniqueId);
+                    continue; 
+                }
+
+                // 🛑 STRICT RADIO LOGIC
+                if (isRadio && groupId) {
+                    if (lockedGroups.has(groupId)) continue; 
+                    
+                    let isSiblingChecked = false;
+                    if (groupId.startsWith('NAME:')) {
+                        const name = groupId.split(':')[1];
+                        if (document.querySelector(`input[name="${name}"]:checked`)) isSiblingChecked = true;
+                    } else if (groupId.startsWith('MAT:')) {
+                        const matId = groupId.split(':')[1];
+                        const grp = document.getElementById(matId);
+                        if (grp && grp.querySelector('.mat-radio-checked')) isSiblingChecked = true;
+                    }
+
+                    if (isSiblingChecked || isChecked(element)) {
+                        console.log(`🔒 Radio group locked: ${rawLabel}`);
+                        lockedGroups.add(groupId);
+                        continue;
+                    }
+                }
+
+                // 🛑 AGGRESSIVE CHECKBOX LOGIC
+                if (isCheckbox) {
+                    if (isChecked(element)) {
+                        continue; 
+                    } else {
+                        console.log(`✅ Force-checking checkbox: ${rawLabel}`);
+                        await smartClick(element);
+                        interactedFields.add(uniqueId);
+                        continue; 
+                    }
+                }
+
+                // 🛑 TEXT FIELD LOGIC
+                if (!isRadio && !isCheckbox && !isFile) {
+                    let curVal = element.value || "";
+                    let cleanVal = curVal.replace(/[_\-\/\s]/g, '');
+                    if (cleanVal.length > 0 && !curVal.includes("Test") && !curVal.includes("Unknown") && !curVal.includes("N/A")) {
+                        continue;
+                    }
+                }
+
+                let valueToFill = null;
+                let shouldInteract = false;
+
+                if (isFallback) {
+                    shouldInteract = true;
+                    if (isRadio) valueToFill = "true";
+                    else {
+                        const key = Object.keys(fillData).find(k => cleanLabel.includes(sanitize(k)));
+                        valueToFill = key ? fillData[key] : "Test Value";
+                    }
+                } else {
+                    const match = aiKeys.find(k => (cleanLabel.includes(k) && k.length > 3) || k === cleanLabel);
+                    if (match) {
+                        shouldInteract = true;
+                        const originalKey = Object.keys(fillData).find(k => sanitize(k) === match);
+                        valueToFill = fillData[originalKey];
+                    }
+                }
+
+                if (shouldInteract) {
+                    if (rawLabel.includes("MM/DD/YYYY") || cleanLabel.includes("mmddyyyy")) valueToFill = "01/01/1990";
+                    if (valueToFill === "N/A" && (cleanLabel.includes('date') || cleanLabel.includes('dob'))) valueToFill = "01/01/1990";
+                }
+
+                if (shouldInteract && valueToFill) {
+                    try {
+                        if (isRadio) {
+                            const valStr = String(valueToFill).toLowerCase();
+                            await smartClick(element);
+                            interactedFields.add(uniqueId);
+                            if (groupId) lockedGroups.add(groupId); 
+                        } 
+                        // ============================================================
+                        // 🔽 DROPDOWN FIX: EXPLICIT CLICK
+                        // ============================================================
+                        else if (element.tagName === 'MAT-SELECT') {
+                            const dropdownId = `DROP:${uniqueId}`;
+                            if (lockedGroups.has(dropdownId)) continue;
+                            const currentText = element.innerText || "";
+                            if (!currentText.toLowerCase().includes('select') && currentText.length > 2) {
+                                lockedGroups.add(dropdownId);
+                                continue;
+                            }
+                            console.log(`🔽 Dropdown: ${rawLabel}`);
+                            
+                            // 1. Click to Open
+                            element.click();
+                            await wait(500); // Wait for animation
+
+                            // 2. Find and Click First Option
+                            const options = document.querySelectorAll('mat-option');
+                            if (options.length > 0) {
+                                console.log("   -> Clicking Option 1");
+                                // We click the first available option
+                                options[0].click();
+                            } else {
+                                // Fallback if no options found in DOM (rare)
+                                console.log("   -> Fallback to Enter Key");
+                                element.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', keyCode: 40, bubbles: true }));
+                                await wait(100);
+                                element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+                            }
+
+                            // 3. Ensure Close (Press Escape)
+                            await wait(200);
+                            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+
+                            lockedGroups.add(dropdownId);
+                            interactedFields.add(uniqueId);
+                        } 
+                        else {
+                            let textVal = String(valueToFill);
+                            console.log(`✍️ Processing Text: "${rawLabel}"`);
+                            setNativeValue(element, textVal, rawLabel); 
+                            interactedFields.add(uniqueId);
+                        }
+                    } catch (e) { console.error("Error", e); }
+                }
+            }
+        }
+
+        function attemptToClickNext() {
+            if (document.querySelector('mat-dialog-container, .modal, .popup')) return;
+            const elements = document.querySelectorAll('button, a, input[type="submit"]');
+            let nextBtn = null;
+            for (const el of elements) {
+                const text = el.innerText.trim();
+                if (NEXT_BUTTON_SELECTORS.some(kw => text === kw)) {
+                    nextBtn = el; break;
+                }
+            }
+            if (nextBtn) {
+                console.log("👉 Clicking Next Button...");
+                nextBtn.click();
+            }
+        }
+
+        function startObserver() {
+            if (observer) observer.disconnect();
+            observer = new MutationObserver((mutations) => {
+                let shouldUpdate = false;
+                for (const m of mutations) {
+                    if (m.addedNodes.length > 0 && document.querySelector('input, select')) {
+                        shouldUpdate = true; break;
+                    }
+                }
+                if (shouldUpdate) {
+                    observer.disconnect();
+                    setTimeout(() => { autoFillAndNavigate(); startObserver(); }, 2000);
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+
         chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             if (request.action === 'startAutoFill') {
-                startObserver();
                 autoFillAndNavigate();
+                startObserver();
                 sendResponse({ success: true });
             }
         });
-        window.hasAutoFillListener = true;
-    }
-
+    })();
 }
